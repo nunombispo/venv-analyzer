@@ -10,6 +10,8 @@ import os
 import sys
 import argparse
 import shutil
+import time
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Dict, Tuple
 import humanize
@@ -81,6 +83,70 @@ def get_directory_size(path: Path) -> int:
     return total_size
 
 
+def get_venv_access_time(path: Path) -> datetime:
+    """
+    Get the most recent access time of a virtual environment.
+    
+    Args:
+        path: Path to the venv folder
+        
+    Returns:
+        datetime: Most recent access time
+    """
+    latest_access = datetime.fromtimestamp(0)  # Start with epoch time
+    
+    try:
+        # Check the venv folder itself
+        stat = path.stat()
+        latest_access = max(latest_access, datetime.fromtimestamp(stat.st_atime))
+        
+        # Check key venv files and directories for access time
+        key_paths = [
+            path / 'Scripts',
+            path / 'bin',
+            path / 'pyvenv.cfg',
+            path / 'activate',
+            path / 'activate.bat',
+            path / 'activate.ps1',
+            path / 'python.exe',
+            path / 'Scripts' / 'python.exe',
+            path / 'bin' / 'python'
+        ]
+        
+        for key_path in key_paths:
+            if key_path.exists():
+                try:
+                    stat = key_path.stat()
+                    latest_access = max(latest_access, datetime.fromtimestamp(stat.st_atime))
+                except (OSError, PermissionError):
+                    continue
+                    
+    except (OSError, PermissionError):
+        pass
+    
+    return latest_access
+
+
+def is_venv_unused(path: Path, days_threshold: int) -> bool:
+    """
+    Check if a virtual environment is unused based on access time.
+    
+    Args:
+        path: Path to the venv folder
+        days_threshold: Number of days without access to consider it unused
+        
+    Returns:
+        bool: True if the venv is unused, False otherwise
+    """
+    try:
+        access_time = get_venv_access_time(path)
+        threshold_time = datetime.now() - timedelta(days=days_threshold)
+        return access_time < threshold_time
+    except (OSError, PermissionError):
+        # If we can't access the folder, consider it unused
+        return True
+
+
 def find_venv_folders(root_path: Path, max_depth: int = None) -> List[Path]:
     """
     Recursively find all virtual environment folders in the given directory.
@@ -115,24 +181,37 @@ def find_venv_folders(root_path: Path, max_depth: int = None) -> List[Path]:
     return venv_folders
 
 
-def analyze_venv_folders(venv_folders: List[Path]) -> Dict:
+def analyze_venv_folders(venv_folders: List[Path], days_threshold: int = None) -> Dict:
     """
     Analyze the found venv folders and return statistics.
     
     Args:
         venv_folders: List of venv folder paths
+        days_threshold: Days threshold for unused detection (None to disable)
         
     Returns:
         Dict: Analysis results
     """
     total_size = 0
     folder_sizes = []
+    unused_folders = []
     
     for folder in venv_folders:
         try:
             size = get_directory_size(folder)
             total_size += size
-            folder_sizes.append((folder, size))
+            
+            # Get access time information
+            access_time = get_venv_access_time(folder)
+            is_unused = False
+            
+            if days_threshold is not None:
+                is_unused = is_venv_unused(folder, days_threshold)
+                if is_unused:
+                    unused_folders.append((folder, size, access_time))
+            
+            folder_sizes.append((folder, size, access_time, is_unused))
+            
         except (OSError, PermissionError):
             # Skip folders we can't access
             continue
@@ -140,10 +219,16 @@ def analyze_venv_folders(venv_folders: List[Path]) -> Dict:
     # Sort by size (largest first)
     folder_sizes.sort(key=lambda x: x[1], reverse=True)
     
+    # Sort unused folders by access time (oldest first)
+    unused_folders.sort(key=lambda x: x[2])
+    
     return {
         'count': len(venv_folders),
         'total_size': total_size,
-        'folder_sizes': folder_sizes
+        'folder_sizes': folder_sizes,
+        'unused_folders': unused_folders,
+        'unused_count': len(unused_folders),
+        'unused_size': sum(size for _, size, _ in unused_folders)
     }
 
 
@@ -184,7 +269,7 @@ def delete_venv_folders(folders_to_delete: List[Tuple[Path, int]], root_path: Pa
     }
 
 
-def display_results(analysis: Dict, root_path: Path, verbose: bool = False, auto_delete: bool = False):
+def display_results(analysis: Dict, root_path: Path, verbose: bool = False, auto_delete: bool = False, clean_unused: bool = False, days_threshold: int = None):
     """
     Display the analysis results in a formatted way.
     
@@ -193,6 +278,8 @@ def display_results(analysis: Dict, root_path: Path, verbose: bool = False, auto
         root_path: Root directory that was analyzed
         verbose: Whether to show detailed information
         auto_delete: Whether to automatically offer deletion
+        clean_unused: Whether to offer cleaning unused venvs
+        days_threshold: Days threshold for unused detection
     """
     print(f"\n{'='*60}")
     print(f"Virtual Environment Analysis Results")
@@ -200,6 +287,11 @@ def display_results(analysis: Dict, root_path: Path, verbose: bool = False, auto
     print(f"Root Directory: {root_path.absolute()}")
     print(f"Total venv folders found: {analysis['count']}")
     print(f"Total size: {humanize.naturalsize(analysis['total_size'])}")
+    
+    if days_threshold is not None:
+        print(f"Unused venv folders (>={days_threshold} days): {analysis['unused_count']}")
+        print(f"Unused venv size: {humanize.naturalsize(analysis['unused_size'])}")
+    
     print(f"{'='*60}")
     
     if analysis['count'] == 0:
@@ -209,21 +301,63 @@ def display_results(analysis: Dict, root_path: Path, verbose: bool = False, auto
     if verbose:
         print("\nDetailed breakdown:")
         print("-" * 60)
-        for i, (folder, size) in enumerate(analysis['folder_sizes'], 1):
+        for i, (folder, size, access_time, is_unused) in enumerate(analysis['folder_sizes'], 1):
             relative_path = folder.relative_to(root_path)
-            print(f"{i:2d}. {relative_path}")
+            status = " (UNUSED)" if is_unused else ""
+            print(f"{i:2d}. {relative_path}{status}")
             print(f"    Size: {humanize.naturalsize(size)}")
+            print(f"    Last accessed: {access_time.strftime('%Y-%m-%d %H:%M:%S')}")
             print()
     else:
         print("\nTop 5 largest venv folders:")
         print("-" * 60)
-        for i, (folder, size) in enumerate(analysis['folder_sizes'][:5], 1):
+        for i, (folder, size, access_time, is_unused) in enumerate(analysis['folder_sizes'][:5], 1):
             relative_path = folder.relative_to(root_path)
-            print(f"{i}. {relative_path} - {humanize.naturalsize(size)}")
+            status = " (UNUSED)" if is_unused else ""
+            print(f"{i}. {relative_path}{status} - {humanize.naturalsize(size)}")
+            print(f"   Last accessed: {access_time.strftime('%Y-%m-%d %H:%M:%S')}")
     
-    # Offer deletion option
-    if auto_delete and analysis['count'] > 0:
-        top_5_folders = analysis['folder_sizes'][:5]
+    # Offer unused venv cleanup
+    if clean_unused and analysis['unused_count'] > 0:
+        print(f"\n{'='*60}")
+        print(f"Unused Virtual Environment Cleanup")
+        print(f"{'='*60}")
+        print(f"Found {analysis['unused_count']} unused venv folders (not accessed in {days_threshold}+ days)")
+        print(f"This would free up {humanize.naturalsize(analysis['unused_size'])} of disk space.")
+        print()
+        
+        print("Unused venv folders (sorted by last access time):")
+        for i, (folder, size, access_time) in enumerate(analysis['unused_folders'], 1):
+            relative_path = folder.relative_to(root_path)
+            days_ago = (datetime.now() - access_time).days
+            print(f"{i}. {relative_path} ({humanize.naturalsize(size)}) - {days_ago} days ago")
+        
+        print()
+        response = input("Delete these unused venv folders? (y/N): ").strip().lower()
+        
+        if response in ['y', 'yes']:
+            # Double confirmation for safety
+            print("\n⚠️  WARNING: This action cannot be undone!")
+            confirm = input("Type 'DELETE' to confirm deletion: ").strip()
+            
+            if confirm == 'DELETE':
+                deletion_results = delete_venv_folders(analysis['unused_folders'], root_path)
+                
+                print(f"\n{'='*60}")
+                print(f"Deletion Summary")
+                print(f"{'='*60}")
+                print(f"Successfully deleted: {deletion_results['deleted_count']} folders")
+                print(f"Failed to delete: {deletion_results['failed_count']} folders")
+                print(f"Space freed: {humanize.naturalsize(deletion_results['freed_space'])}")
+                print(f"{'='*60}")
+            else:
+                print("Deletion cancelled.")
+        else:
+            print("No folders were deleted.")
+    
+    # Offer deletion option for top 5 largest
+    elif auto_delete and analysis['count'] > 0:
+        top_5_folders = [(folder, size) for folder, size, _, _ in analysis['folder_sizes'][:5]]
         total_size_top_5 = sum(size for _, size in top_5_folders)
         
         print(f"\n{'='*60}")
@@ -273,6 +407,7 @@ Examples:
   python venv_analyzer.py -v                 # Verbose output
   python venv_analyzer.py --max-depth 3      # Limit search depth
   python venv_analyzer.py --auto-delete      # Offer to delete top 5 largest
+  python venv_analyzer.py --clean-unused 30  # Clean venvs unused for 30+ days
         """
     )
     
@@ -301,7 +436,20 @@ Examples:
         help='Offer to delete the top 5 largest venv folders after analysis'
     )
     
+    parser.add_argument(
+        '--clean-unused',
+        type=int,
+        metavar='DAYS',
+        help='Clean venv folders that have not been accessed in DAYS or more'
+    )
+    
     args = parser.parse_args()
+    
+    # Validate that only one deletion option is used
+    if args.auto_delete and args.clean_unused is not None:
+        print("Error: Cannot use both --auto-delete and --clean-unused at the same time.")
+        print("Use --auto-delete to delete the largest venvs, or --clean-unused to delete unused venvs.")
+        sys.exit(1)
     
     # Convert to Path object
     root_path = Path(args.directory)
@@ -323,10 +471,10 @@ Examples:
         venv_folders = find_venv_folders(root_path, args.max_depth)
         
         # Analyze the results
-        analysis = analyze_venv_folders(venv_folders)
+        analysis = analyze_venv_folders(venv_folders, args.clean_unused)
         
         # Display results
-        display_results(analysis, root_path, args.verbose, args.auto_delete)
+        display_results(analysis, root_path, args.verbose, args.auto_delete, args.clean_unused is not None, args.clean_unused)
         
     except KeyboardInterrupt:
         print("\nAnalysis interrupted by user.")

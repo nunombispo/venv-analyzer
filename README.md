@@ -2,6 +2,8 @@
 
 A Python script that analyzes directories to find virtual environment (venv) folders and displays information about their size and count. **Now with cleanup functionality to delete large venv folders and automatically clean unused venvs based on access time!**
 
+If these scripts were useful to you, consider donating to support the Developer Service Blog: https://buy.stripe.com/bIYdTrggi5lZamkdQW
+
 ## Features
 
 - **Comprehensive Detection**: Identifies various types of virtual environment folders including:
